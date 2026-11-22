@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rooftop Cat — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #191430; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #game { width: min(100vw, 177.78vh); aspect-ratio: 16 / 9; display: block;
+          box-shadow: 0 0 60px rgba(0,0,0,.6); cursor: pointer; touch-action: manipulation; }
+  #hint { position: fixed; left: 0; right: 0; bottom: 10px; text-align: center;
+          color: #f5d0a9; font: 14px/1.4 system-ui, sans-serif; opacity: .75;
+          pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="hint">click, tap or press space to jump &mdash; land on the next roof</div>
+<script>
+'use strict';
+/*
+ * ROOFTOP CAT — a tiny browser game built from ONE prompt.
+ * The prompt (see GAME_PROMPT.md): a cat leaping between rooftops at dusk.
+ * One button to jump. Land on the next roof or fall. Score +1 per roof.
+ * Speed rises as you score. Dusk skyline, big moon, game over + restart.
+ * Juicy bits: squash and stretch, dust puffs on landing, a flash on a
+ * perfect landing. No assets, no dependencies — one file, canvas only.
+ */
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = 960, H = 540;
+
+// --- tuning (the same numbers the video's frames were rendered from) ---
+const GRAVITY = 0.55;        // px / frame^2
+const JUMP_V = -13.6;        // px / frame
+const GROUND_Y = 430;        // roof-top line the cat runs on
+const CAT_X = 250;           // the cat stays here; the world scrolls
+const BASE_SPEED = 4.6;      // px / frame, +0.16 per roof landed
+const PERFECT_PX = 26;       // landing this close to a roof's centre is perfect
+
+let state = 'ready';         // ready | playing | falling | over
+let score = 0, best = 0;
+try { best = Number(localStorage.getItem('rooftop-cat-best') || 0); } catch (e) { /* private mode */ }
+let speed = BASE_SPEED;
+let frame = 0;
+
+// --- the cat ---
+const cat = { y: GROUND_Y, vy: 0, squash: 0, stretch: 0, rot: 0, dead: false };
+let grounded = null;       // the roof the cat stands on, or null when airborne
+let lastRoof = null;       // the roof the cat last landed on (no score for hopping on one roof)
+
+// --- roofs: {x, w, top} ; they scroll left, new ones spawn on the right ---
+let roofs = [];
+let roofGap = 0;
+function newRoof(x) {
+  const w = 150 + Math.random() * 130;
+  const top = GROUND_Y - 20 - Math.random() * 70;
+  return { x, w, top };
+}
+function resetWorld() {
+  roofs = [{ x: -40, w: 420, top: GROUND_Y }];
+  let x = 380;
+  while (x < W + 400) { const r = newRoof(x); roofs.push(r); x = r.x + r.w + 90 + Math.random() * 90; }
+  roofGap = 0;
+}
+resetWorld();
+
+// --- particles: dust puffs + perfect-landing sparks ---
+let parts = [];
+function puff(x, y, n, col) {
+  for (let i = 0; i < n; i++) parts.push({
+    x, y, vx: (Math.random() - .5) * 3, vy: -Math.random() * 2.4,
+    life: 22 + Math.random() * 10, max: 32, col, r: 2 + Math.random() * 3.5
+  });
+}
+
+// --- stars + skyline (seeded once so the dusk never changes) ---
+const stars = [];
+for (let i = 0; i < 90; i++) stars.push({ x: Math.random() * W, y: Math.random() * 240, r: Math.random() * 1.6 + .4, tw: Math.random() * 6.28 });
+function skyline(seed, col, base, amp) {
+  let s = seed;
+  const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  ctx.fillStyle = col;
+  let x = -((frame * speed * 0.35) % 120);
+  while (x < W) { const bw = 50 + rnd() * 70, bh = base + rnd() * amp; ctx.fillRect(x, GROUND_Y + 46 - bh, bw, bh + 80); x += bw + 8; }
+}
+
+function roofUnderCat() {
+  for (const r of roofs) if (CAT_X >= r.x - 14 && CAT_X <= r.x + r.w + 14) return r;
+  return null;
+}
+
+function jump() {
+  if (state === 'ready') { state = 'playing'; grounded = roofs[0]; lastRoof = roofs[0]; }
+  if (state === 'over') { startOver(); return; }
+  if (state !== 'playing') return;
+  if (grounded) {
+    cat.vy = JUMP_V; cat.stretch = 1; cat.squash = 0;
+    grounded = null;
+  }
+}
+function startOver() {
+  score = 0; speed = BASE_SPEED; frame = 0; parts = [];
+  cat.y = GROUND_Y; cat.vy = 0; cat.squash = 0; cat.stretch = 0; cat.rot = 0; cat.dead = false;
+  resetWorld(); grounded = roofs[0]; lastRoof = roofs[0]; state = 'playing';
+}
+
+function landOn(r) {
+  const perfect = Math.abs(CAT_X - (r.x + r.w / 2)) < PERFECT_PX;
+  cat.y = r.top; cat.vy = 0; cat.squash = 1; cat.stretch = 0;
+  puff(CAT_X, r.top + 4, perfect ? 16 : 8, perfect ? '#ffd166' : '#c9b8a3');
+  if (r !== lastRoof) { score++; speed = BASE_SPEED + score * 0.16; lastRoof = r; }
+  if (perfect) flash = 10;
+  grounded = r;
+}
+
+function step() {
+  frame++;
+  if (state === 'playing' || state === 'falling') {
+    // scroll the world
+    for (const r of roofs) r.x -= speed;
+    if (roofs.length && roofs[0].x + roofs[0].w < -60) roofs.shift();
+    const last = roofs[roofs.length - 1];
+    if (last.x + last.w < W + 60) {
+      const gap = 95 + Math.random() * 95 + Math.min(score * 3, 60);
+      roofs.push(newRoof(last.x + last.w + gap));
+    }
+    cat.squash *= 0.86; cat.stretch *= 0.86; cat.rot *= 0.9;
+    if (state === 'playing') {
+      if (grounded) {
+        // running on a roof: glued to its top while it scrolls under the cat
+        cat.y = grounded.top; cat.vy = 0;
+        const under = roofUnderCat();
+        if (under !== grounded) {
+          if (!under) grounded = null;                                            // over a gap: start falling
+          else if (under.top < cat.y - 8) { state = 'falling'; cat.vy = 1; grounded = null; } // tripped on a taller roof's wall
+          else if (under.top > cat.y + 8) grounded = null;                       // step down: fall onto it
+          else { cat.y = under.top; landOn(under); }                             // small step: snap on
+        }
+      } else {
+        // airborne: integrate, then test for a landing crossed from above
+        const prevY = cat.y;
+        cat.vy += GRAVITY; cat.y += cat.vy;
+        const r = roofUnderCat();
+        if (r && cat.vy > 0 && prevY < r.top - 1 && cat.y >= r.top) landOn(r);
+      }
+      if (cat.y > H + 40) state = 'falling';
+    } else if (state === 'falling') {
+      cat.vy += GRAVITY; cat.y += cat.vy;
+      if (cat.y > H + 120) {
+        state = 'over';
+        if (score > best) { best = score; try { localStorage.setItem('rooftop-cat-best', String(best)); } catch (e) {} }
+      }
+    }
+  }
+  // particles always age
+  for (const p of parts) { p.x += p.vx; p.y += p.vy; p.vy += 0.08; p.life--; }
+  parts = parts.filter(p => p.life > 0);
+}
+
+let flash = 0;
+
+// --- drawing ---
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1e1b4b'); g.addColorStop(.55, '#7c3f6e'); g.addColorStop(.8, '#e8734a'); g.addColorStop(1, '#f7a85c');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // stars
+  for (const s of stars) {
+    ctx.globalAlpha = .35 + .35 * Math.sin(frame * .03 + s.tw);
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // big moon
+  ctx.fillStyle = '#ffe9c4'; ctx.beginPath(); ctx.arc(770, 105, 52, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#f7cf96'; ctx.beginPath(); ctx.arc(752, 92, 10, 0, 6.29); ctx.arc(786, 118, 7, 0, 6.29); ctx.fill();
+  // far + near skyline
+  skyline(12345, '#3b2d5c', 120, 90);
+  skyline(987, '#2a2144', 170, 110);
+}
+function drawRoofs() {
+  for (const r of roofs) {
+    ctx.fillStyle = '#241a33'; ctx.fillRect(r.x, r.top, r.w, H - r.top);
+    ctx.fillStyle = '#3d2b52'; ctx.fillRect(r.x, r.top, r.w, 8);           // roof edge
+    ctx.fillStyle = '#ffd166';
+    const lit = ((r.x / 46) | 0) % 2 === 0;                                  // lit windows
+    if (lit) ctx.fillRect(r.x + r.w * .3, r.top + 26, 12, 16);
+    if (((r.x / 91) | 0) % 3 === 0) ctx.fillRect(r.x + r.w * .65, r.top + 30, 12, 16);
+    // chimney
+    ctx.fillStyle = '#1c1428'; ctx.fillRect(r.x + r.w - 34, r.top - 22, 18, 22);
+  }
+}
+function drawCat() {
+  const squashY = 1 - cat.squash * .28 + cat.stretch * .22;
+  const squashX = 1 + cat.squash * .3 - cat.stretch * .18;
+  ctx.save();
+  ctx.translate(CAT_X, cat.y);
+  ctx.rotate(cat.rot + Math.max(-.3, Math.min(.3, cat.vy * .012)));
+  ctx.scale(squashX, squashY);
+  // tail
+  ctx.strokeStyle = '#e8893a'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-26, -16);
+  ctx.quadraticCurveTo(-44, -30 - Math.sin(frame * .12) * 4, -38, -44); ctx.stroke();
+  // body
+  ctx.fillStyle = '#f59e42'; ctx.beginPath(); ctx.ellipse(0, -16, 26, 15, 0, 0, 6.29); ctx.fill();
+  // stripes
+  ctx.strokeStyle = '#d97b29'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-12, -28); ctx.lineTo(-8, -8); ctx.moveTo(0, -30); ctx.lineTo(4, -8); ctx.moveTo(12, -28); ctx.lineTo(15, -8); ctx.stroke();
+  // head
+  ctx.fillStyle = '#f59e42'; ctx.beginPath(); ctx.arc(22, -30, 15, 0, 6.29); ctx.fill();
+  // ears
+  ctx.beginPath(); ctx.moveTo(12, -38); ctx.lineTo(14, -50); ctx.lineTo(22, -40); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(26, -42); ctx.lineTo(32, -52); ctx.lineTo(36, -40); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#f7c9a0';
+  ctx.beginPath(); ctx.moveTo(15, -40); ctx.lineTo(16, -46); ctx.lineTo(20, -41); ctx.closePath(); ctx.fill();
+  // eye
+  ctx.fillStyle = '#221533'; ctx.beginPath(); ctx.arc(28, -32, 2.6, 0, 6.29); ctx.fill();
+  // legs
+  ctx.strokeStyle = '#e8893a'; ctx.lineWidth = 5;
+  const run = state === 'playing' && cat.vy === 0 ? Math.sin(frame * .5) * 5 : 0;
+  ctx.beginPath(); ctx.moveTo(-14, -6); ctx.lineTo(-14 + run, 2); ctx.moveTo(12, -6); ctx.lineTo(12 - run, 2); ctx.stroke();
+  ctx.restore();
+}
+function drawParts() {
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawHud() {
+  ctx.fillStyle = 'rgba(20,12,40,.55)';
+  ctx.fillRect(W - 200, 18, 182, 86);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 44px system-ui, sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(String(score), W - 36, 66);
+  ctx.font = '16px system-ui, sans-serif'; ctx.fillStyle = '#f5d0a9';
+  ctx.fillText('SCORE', W - 36, 92);
+  ctx.textAlign = 'left';
+  if (flash > 0) {
+    ctx.globalAlpha = Math.min(1, flash / 8);
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 34px system-ui, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('PERFECT!', W / 2, 120);
+    ctx.globalAlpha = 1; ctx.textAlign = 'left';
+  }
+  if (state === 'ready') {
+    ctx.fillStyle = 'rgba(20,12,40,.6)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 54px system-ui, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('ROOFTOP CAT', W / 2, 210);
+    ctx.font = '22px system-ui, sans-serif'; ctx.fillStyle = '#f5d0a9';
+    ctx.fillText('one button. one cat. one prompt.', W / 2, 252);
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.fillText('click, tap or press space to jump', W / 2, 320);
+    ctx.textAlign = 'left';
+  }
+  if (state === 'over') {
+    ctx.fillStyle = 'rgba(20,12,40,.62)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 48px system-ui, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, 220);
+    ctx.font = '26px system-ui, sans-serif'; ctx.fillStyle = '#f5d0a9';
+    ctx.fillText('score ' + score + '  ·  best ' + best, W / 2, 268);
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 24px system-ui, sans-serif';
+    ctx.fillText('click or press space to play again', W / 2, 322);
+    ctx.textAlign = 'left';
+  }
+}
+function loop() {
+  step();
+  if (flash > 0) flash--;
+  drawSky(); drawRoofs(); drawParts(); drawCat(); drawHud();
+  requestAnimationFrame(loop);
+}
+cv.addEventListener('pointerdown', jump);
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); jump(); }
+});
+loop();
+</script>
+</body>
+</html>
